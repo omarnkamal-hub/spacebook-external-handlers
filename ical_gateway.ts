@@ -1,88 +1,77 @@
-import { createClientFromRequest } from 'npm:@base44/sdk@0.7.1';
+import { serve } from "https://deno.land/std@0.224.0/http/server.ts";
 
-console.log('Deno Deploy iCal Gateway starting...');
+// IMPORTANT: These environment variables must be set in Deno Deploy
+const BASE44_APP_ID = Deno.env.get("BASE44_APP_ID");
+const BASE44_API_KEY = Deno.env.get("BASE44_API_KEY");
 
-Deno.serve(async (req) => {
-    console.log('Received request:', req.method, new URL(req.url).pathname);
+// Construct the URL for your internal Base44 function dynamically
+// Ensure this matches the exact API endpoint shown in your Base44 dashboard for generateIcalExport
+const BASE44_FUNCTION_URL = `https://space-book-${BASE44_APP_ID}.base44.app/api/apps/${BASE44_APP_ID}/functions/generateIcalExport`;
 
+console.log("Deno Deploy iCal Gateway starting...");
+
+serve(async (req: Request) => {
+    const url = new URL(req.url);
+    console.log(`Received request: ${req.method} ${url.pathname}`);
+
+    // Define CORS headers for the iCal feed (optional, but good practice)
     const corsHeaders = {
         'Access-Control-Allow-Origin': '*',
-        'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type, api_key',
+        'Access-Control-Allow-Methods': 'GET, OPTIONS',
+        'Access-Control-Allow-Headers': 'Content-Type',
     };
 
+    // Handle OPTIONS pre-flight request
     if (req.method === 'OPTIONS') {
+        console.log('OPTIONS request received (pre-flight)');
         return new Response(null, { status: 200, headers: corsHeaders });
     }
 
-    const url = new URL(req.url);
+    // Only handle GET requests for the specific path for iCal export
+    if (req.method === "GET" && url.pathname === "/ical/export") {
+        const token = url.searchParams.get("token");
+        console.log(`GET /ical/export received. Token: ${token ? 'YES' : 'NO'} (${token})`);
 
-    if (url.pathname === '/ical/export') {
+        if (!token) {
+            console.warn("Missing token for /ical/export request.");
+            return new Response("Missing token parameter", { status: 400, headers: corsHeaders });
+        }
+
         try {
-            const token = url.searchParams.get('token');
-            console.log('GET /ical/export received. Token:', token ? 'YES (' + token + ')' : 'NO');
-
-            if (!token) {
-                return Response.json({ error: 'Missing export token' }, { status: 400, headers: corsHeaders });
-            }
-
-            const BASE44_APP_ID = Deno.env.get("BASE44_APP_ID");
-            if (!BASE44_APP_ID) {
-                console.error("BASE44_APP_ID environment variable not set in Deno Deploy project.");
-                return Response.json({
-                    error: 'Server configuration error: BASE44_APP_ID not set'
-                }, { status: 500, headers: corsHeaders });
-            }
-
-            console.log('Using BASE44_APP_ID:', BASE44_APP_ID);
-
-            // --- NEW CRITICAL CHANGE: Create a modified Request object with the header ---
-            const modifiedHeaders = new Headers(req.headers);
-            modifiedHeaders.set('Base44-App-Id', BASE44_APP_ID);
-
-            const modifiedReq = new Request(req.url, {
-                method: req.method,
-                headers: modifiedHeaders,
-                body: req.body,
-                redirect: req.redirect,
-                referrer: req.referrer,
-                signal: req.signal,
+            console.log(`Making authenticated POST to Base44 function: ${BASE44_FUNCTION_URL}`);
+            // Make an authenticated POST request to your internal Base44 function
+            const response = await fetch(BASE44_FUNCTION_URL, {
+                method: "POST", // Base44 internal functions expect POST
+                headers: {
+                    "Content-Type": "application/json",
+                    "api_key": BASE44_API_KEY, // Authenticate with your Base44 API key
+                },
+                body: JSON.stringify({ token: token }), // Send token in the request body
             });
-            // --- END NEW CRITICAL CHANGE ---
 
-            // Initialize Base44 SDK with the modified Request object
-            const base44 = createClientFromRequest(modifiedReq, { app_id: BASE44_APP_ID });
+            if (!response.ok) {
+                const errorBody = await response.text();
+                console.error(`Error from Base44 function (${response.status}): ${errorBody}`);
+                return new Response(`Error fetching iCal data from Base44: ${response.status} - ${errorBody}`, { status: response.status, headers: corsHeaders });
+            }
 
-            const base44Response = await base44.asServiceRole.functions.invoke('generateIcalExport', { token });
+            const icalContent = await response.text();
+            console.log("Successfully fetched iCal content from Base44.");
 
-            console.log('Successfully fetched iCal content from Base44.');
-
-            // The SDK's invoke method returns an object with a 'data' property
-            const icsContent = base44Response.data;
-
-            return new Response(icsContent, {
+            return new Response(icalContent, {
                 status: 200,
                 headers: {
                     ...corsHeaders,
-                    'Content-Type': 'text/calendar; charset=utf-8',
-                    'Content-Disposition': 'attachment; filename="spacebook-bookings.ics"',
+                    "Content-Type": "text/calendar; charset=utf-8",
+                    "Content-Disposition": "attachment; filename=\"spacebook-calendar.ics\"", // Suggests download
                 },
             });
-
         } catch (error) {
-            console.error('Error in iCal export:', error);
-            // Include error details for easier debugging
-            return Response.json({
-                error: 'Failed to generate iCal feed',
-                details: error.message,
-                stack: error.stack
-            }, { status: 500, headers: corsHeaders });
+            console.error("External handler encountered an error calling Base44:", error);
+            return new Response(`External handler internal error: ${error.message}`, { status: 500, headers: corsHeaders });
         }
     }
 
-    console.log('Unhandled request:', req.method, url.pathname);
-    return new Response('iCal Gateway - Only /ical/export endpoint is available', {
-        status: 404,
-        headers: corsHeaders
-    });
+    console.log(`Unhandled request: ${req.method} ${url.pathname}`);
+    return new Response("Not Found", { status: 404, headers: corsHeaders });
 });
